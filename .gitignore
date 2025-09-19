@@ -1,8 +1,6 @@
-echo ".venv/
+.venv/
 __pycache__/
 *.pyc
 *.pcap
 *.csv
 *.log
-" > .gitignore
-.venv/
