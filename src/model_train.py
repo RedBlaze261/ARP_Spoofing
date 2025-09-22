@@ -1,79 +1,128 @@
 import argparse
+import os
+import joblib
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.utils import class_weight
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-import joblib
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Masking
+from tensorflow.keras.callbacks import EarlyStopping
 
-def load_data():
-    # Load feature CSVs
-    normal = pd.read_csv("data/features/normal.csv")
-    attack = pd.read_csv("data/features/attack.csv")
-    pure_attack = pd.read_csv("data/features/pure_attack.csv")  # include pure attack
-
-    # Assign labels
-    normal["label"] = 0
-    attack["label"] = 1
-    pure_attack["label"] = 1  # attacks
-
-    # Combine all data
-    df = pd.concat([normal, attack, pure_attack], ignore_index=True)
-
-    # Separate features and labels
-    feature_cols = [c for c in df.columns if c != "label"]
-    X = df[feature_cols].values
-    y = df["label"].values
-
-    # Scale features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    joblib.dump(scaler, "models/scaler.joblib")
-
-    # reshape for LSTM: (samples, timesteps=1, features)
-    X_scaled = X_scaled.reshape((X_scaled.shape[0], 1, X_scaled.shape[1]))
-    return X_scaled, y, scaler
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--hidden", default="64,32", help="Hidden layer sizes, e.g. 64,32")
-    parser.add_argument("--max-iter", type=int, default=50)
-    args = parser.parse_args()
-
-    hidden = [int(h) for h in args.hidden.split(",")]
-
-    X, y, scaler = load_data()
-
-    # Train/test split
-    split = int(0.8 * len(X))
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
-
-    # Compute class weights for imbalance
-    weights = class_weight.compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
-    class_weights = dict(enumerate(weights))
-
-    # Build LSTM model
+def build_lstm_model(input_shape, hidden_units=[64, 32], dropout=0.3, lr=0.001):
+    from tensorflow.keras.optimizers import Adam
     model = Sequential()
-    model.add(LSTM(hidden[0], return_sequences=True, input_shape=(X.shape[1], X.shape[2])))
-    model.add(Dropout(0.2))
-    model.add(LSTM(hidden[1]))
-    model.add(Dropout(0.2))
-    model.add(Dense(1, activation="sigmoid"))
+    # Masking layer in case of padded sequences
+    model.add(Masking(mask_value=0.0, input_shape=input_shape))
+    # First LSTM layer
+    model.add(LSTM(hidden_units[0], return_sequences=True))
+    model.add(Dropout(dropout))
+    # Second LSTM (optional)
+    if len(hidden_units) > 1:
+        model.add(LSTM(hidden_units[1]))
+        model.add(Dropout(dropout))
+    # Output
+    model.add(Dense(1, activation='sigmoid'))
+    model.compile(loss='binary_crossentropy',
+                  optimizer=Adam(learning_rate=lr),
+                  metrics=['accuracy'])
+    return model
 
-    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+def preprocess_packet_df(df, feature_cols):
+    # Encode categorical fields (MAC/IP)
+    encoders = {}
+    for col in feature_cols:
+        if df[col].dtype == 'object':
+            le = LabelEncoder()
+            df[col] = le.fit_transform(df[col].astype(str))
+            encoders[col] = le
+    return df, encoders
 
-    # Train
-    model.fit(
+def create_sequences(X, y, seq_len=10):
+    """Convert per-packet data into sequences for LSTM."""
+    sequences = []
+    labels = []
+    for i in range(len(X) - seq_len + 1):
+        sequences.append(X[i:i+seq_len])
+        labels.append(y[i+seq_len-1])  # label for last packet in sequence
+    return np.array(sequences, dtype=np.float32), np.array(labels, dtype=np.int32)
+
+def train(args):
+    print("[*] Loading CSVs...")
+    normal_df = pd.read_csv(args.normal)
+    normal_df['label'] = 0
+
+    attack_dfs = []
+    for attack_file in args.attacks:
+        df = pd.read_csv(attack_file)
+        df['label'] = 1
+        attack_dfs.append(df)
+
+    df = pd.concat([normal_df] + attack_dfs, ignore_index=True)
+    print(f"[*] Combined dataset shape: {df.shape}")
+
+    feature_cols = ['op', 'sender_ip', 'target_ip', 'sender_mac', 'target_mac']
+    df, encoders = preprocess_packet_df(df, feature_cols)
+
+    X = df[feature_cols].values.astype(float)
+    y = df['label'].values.astype(int)
+
+    # Normalize features
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X)
+
+    # Create sequences
+    X_seq, y_seq = create_sequences(X, y, seq_len=args.seq_len)
+    print(f"[*] Sequence data shape: {X_seq.shape}, {y_seq.shape}")
+
+    # Train/val split
+    split_idx = int(len(X_seq) * (1 - args.val_split))
+    X_train, X_val = X_seq[:split_idx], X_seq[split_idx:]
+    y_train, y_val = y_seq[:split_idx], y_seq[split_idx:]
+
+    # Build model
+    model = build_lstm_model(
+        input_shape=(X_seq.shape[1], X_seq.shape[2]),
+        hidden_units=args.hidden,
+        dropout=args.dropout,
+        lr=args.lr
+    )
+
+    callbacks = [EarlyStopping(monitor='val_loss', patience=args.patience, restore_best_weights=True)]
+
+    print("[*] Training...")
+    history = model.fit(
         X_train, y_train,
-        validation_data=(X_test, y_test),
-        epochs=args.max_iter,
-        class_weight=class_weights,
-        batch_size=32
+        validation_data=(X_val, y_val),
+        epochs=args.epochs,
+        batch_size=args.batch,
+        callbacks=callbacks,
+        verbose=1
     )
 
     # Save model
-    model.save("models/lstm_model.h5")
-    print("[+] Model saved to models/lstm_model.h5")
+    os.makedirs(os.path.dirname(args.model_out), exist_ok=True)
+    model.save(args.model_out)
+    print(f"[+] Model saved to {args.model_out}")
 
+    # Save scaler + encoders
+    os.makedirs(os.path.dirname(args.scaler_out), exist_ok=True)
+    joblib.dump({'scaler': scaler, 'encoders': encoders}, args.scaler_out)
+    print(f"[+] Scaler & encoders saved to {args.scaler_out}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--normal", required=True, help="Normal CSV path")
+    parser.add_argument("--attacks", nargs='+', required=True, help="Attack CSV paths")
+    parser.add_argument("--model_out", default="models/lstm_arp_detector.h5")
+    parser.add_argument("--scaler_out", default="models/lstm_scaler.pkl")
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--val_split", type=float, default=0.2)
+    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--hidden", nargs='+', type=int, default=[64,32])
+    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--seq_len", type=int, default=10, help="Number of packets per LSTM sequence")
+
+    args = parser.parse_args()
+    train(args)
