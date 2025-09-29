@@ -1,33 +1,23 @@
-# Python / virtualenv
+# ignore env & heavy artifacts
 .venv/
 venv/
 __pycache__/
 *.pyc
 
-# Data / pcaps
+# data / pcaps
 data/
 *.pcap
 *.pcapng
 
-# Models / checkpoints / results
+# models / checkpoints / results
 models/
 backup_models/
 results/
-*.h5
-*.pt
-*.ckpt
-*.pth
 
-# build / IDE / OS
-.DS_Store
+# large libraries
+*.so
+
+# editor / OS
 .vscode/
 .idea/
-*.log
-
-# VM / large binaries
-*.vmdk
-*.vmx
-*.lck
-
-# Jupyter
-.ipynb_checkpoints/
+.DS_Store
