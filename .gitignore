@@ -10,9 +10,7 @@ data/
 *.pcapng
 
 # models / checkpoints / results
-models/
-backup_models/
-results/
+
 
 # large libraries
 *.so
